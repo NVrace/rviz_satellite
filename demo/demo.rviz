@@ -28,28 +28,11 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
-    - Alpha: 0.5
-      Cell Size: 1
-      Class: rviz_default_plugins/Grid
-      Color: 160; 160; 164
-      Enabled: true
-      Line Style:
-        Line Width: 0.029999999329447746
-        Value: Lines
-      Name: Grid
-      Normal Cell Count: 0
-      Offset:
-        X: 0
-        Y: 0
-        Z: 0
-      Plane: XY
-      Plane Cell Count: 10
-      Reference Frame: <Fixed Frame>
-      Value: true
     - Alpha: 0.699999988079071
       Blocks: 3
       Class: rviz_satellite/AerialMap
       Draw Behind: false
+      ENU Aligned Reference Frame: map
       Enabled: true
       Name: AerialMap
       Object URI: https://tile.openstreetmap.org/{z}/{x}/{y}.png
@@ -61,8 +44,22 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /fix
+      Use Local Map:
+        Meter per Pixel (Zoom 0): 0
+        Origin CRS: ""
+        "Origin X ": 0
+        "Origin Y ": 0
+        Value: false
       Value: true
+      Visualize in UTM Frame: false
       Zoom: 16
+    - Class: rviz_default_plugins/Axes
+      Enabled: true
+      Length: 20
+      Name: GPS Sensor
+      Radius: 2
+      Reference Frame: gps_sensor
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48

@@ -91,9 +91,10 @@ def main():
         publisher.publish(fix)
 
     node.create_timer(0.1, timer_callback)
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == '__main__':

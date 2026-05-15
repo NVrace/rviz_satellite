@@ -54,12 +54,12 @@ using rviz_common::properties::Property;
 using rviz_common::properties::RosTopicProperty;
 using rviz_common::properties::StatusProperty;
 using rviz_common::properties::StringProperty;
+using rviz_common::properties::TfFrameProperty;
 
 using sensor_msgs::msg::NavSatFix;
 
 // disable cpplint: not using string as const char*
 // declaring as std::string and QString to avoid copies
-const std::string AerialMapDisplay::MAP_FRAME = "map";                    // NOLINT
 const QString AerialMapDisplay::MESSAGE_STATUS = "Message";               // NOLINT
 const QString AerialMapDisplay::TILE_REQUEST_STATUS = "TileRequest";      // NOLINT
 const QString AerialMapDisplay::PROPERTIES_STATUS = "Properties";         // NOLINT
@@ -81,6 +81,12 @@ AerialMapDisplay::AerialMapDisplay() : RosTopicDisplay()
     " drawn behind everything else.",
     this, SLOT(updateDrawUnder()));
   draw_under_property_->setShouldBeSaved(true);
+
+  orientation_frame_property_ = new TfFrameProperty(
+    "ENU Aligned Reference Frame", "map",
+    "The ENU-aligned TF frame used to orient the satellite map. "
+    "Ensures tiles stay aligned with compass directions regardless of the fixed frame.",
+    this);
 
   visualize_in_utm_frame = new BoolProperty(
     "Visualize in UTM Frame", false, "If true, calculate UTM to LL rotation", this,
@@ -150,7 +156,11 @@ AerialMapDisplay::AerialMapDisplay() : RosTopicDisplay()
 
 AerialMapDisplay::~AerialMapDisplay() {}
 
-void AerialMapDisplay::onInitialize() { RTDClass::onInitialize(); }
+void AerialMapDisplay::onInitialize()
+{
+  RTDClass::onInitialize();
+  orientation_frame_property_->setFrameManager(context_->getFrameManager());
+}
 
 void AerialMapDisplay::onEnable() { scene_node_->setVisible(true); }
 
@@ -508,8 +518,8 @@ void AerialMapDisplay::update(float, float)
   try {
     // get transformation of fixed frame to map, to set the aerial map orientation to be aligned with ENU
     get_fixed_frame_transform_fallback_to_latest(
-      context_->getFrameManager(), MAP_FRAME, t, tf_tolerance(), _ignored_translation,
-      orientation_to_map);
+      context_->getFrameManager(), orientation_frame_property_->getFrameStd(), t, tf_tolerance(),
+      _ignored_translation, orientation_to_map);
     setStatus(rviz_common::properties::StatusProperty::Ok, ORIENTATION_STATUS, "Map transform OK");
   } catch (const rviz_common::transformation::FrameTransformerException & e) {
     setStatus(rviz_common::properties::StatusProperty::Ok, TRANSFORM_STATUS, e.what());

@@ -25,6 +25,7 @@ limitations under the License. */
 #include "rviz_common/properties/float_property.hpp"
 #include "rviz_common/properties/int_property.hpp"
 #include "rviz_common/properties/string_property.hpp"
+#include "rviz_common/properties/tf_frame_property.hpp"
 #include "tile.hpp"
 #include "tile_client.hpp"
 #include "tile_object.hpp"
@@ -98,6 +99,7 @@ protected:
   rviz_common::properties::FloatProperty * local_origin_x_property_ = nullptr;
   rviz_common::properties::FloatProperty * local_origin_y_property_ = nullptr;
 
+  rviz_common::properties::TfFrameProperty * orientation_frame_property_ = nullptr;
   rviz_common::properties::BoolProperty * use_local_tiles_property_ = nullptr;
   rviz_common::properties::BoolProperty * visualize_in_utm_frame = nullptr;
 
@@ -111,7 +113,6 @@ protected:
   sensor_msgs::msg::NavSatFix::ConstSharedPtr last_fix_;
   bool tile_server_had_errors_{false};
 
-  static const std::string MAP_FRAME;
   static const QString MESSAGE_STATUS;
   static const QString TILE_REQUEST_STATUS;
   static const QString PROPERTIES_STATUS;

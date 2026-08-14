@@ -14,8 +14,10 @@ limitations under the License. */
 
 #pragma once
 
+#include <chrono>
 #include <map>
 #include <memory>
+#include <optional>
 #include <rclcpp/rclcpp.hpp>
 #include <rviz_common/ros_topic_display.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
@@ -73,15 +75,25 @@ protected:
 
   void buildTile(TileCoordinate coordinate, Ogre::Vector2i offset, double size);
 
+  /// Drop all tiles and abort their requests; the caller must hold tiles_mutex_
+  void clearTiles();
+
   void resetMap();
 
   void resetTileServerError();
 
+  /**
+   * @brief React to a failed tile request
+   *
+   * Transient failures are retried after a backoff, so the display recovers on its own once the
+   * connection is stable again. Permanent failures disable requests until a tile server relevant
+   * property changes.
+   */
+  void handleTileRequestFailure(const tile_request_error & e);
+
   void updateAlpha(const rclcpp::Time & t);
 
   rclcpp::Duration tf_tolerance() const;
-
-  TileCoordinate centerTile() const;
 
   double computeUTMrotation(double latitude, double longitude);
 
@@ -109,9 +121,20 @@ protected:
   TileMapInformation tile_map_info_;
   std::map<TileId, std::future<QImage>> pending_tiles_;
   std::map<TileId, TileObject> tiles_;
+  /// Coordinate the tile field is centered on; empty while no map is built
+  std::optional<TileCoordinate> center_tile_;
 
   sensor_msgs::msg::NavSatFix::ConstSharedPtr last_fix_;
+  /// set on permanent failures only; cleared when a tile server relevant property changes
   bool tile_server_had_errors_{false};
+  /// no tiles are requested before this point in time, to back off after transient failures
+  std::chrono::steady_clock::time_point retry_tiles_after_{};
+  int consecutive_tile_failures_{0};
+
+  /// Delay before the map is rebuilt after a transient failure; doubled per consecutive failure
+  static constexpr int TILE_RETRY_BASE_DELAY_MS = 1000;
+  /// Caps the backoff at TILE_RETRY_BASE_DELAY_MS << (MAX_BACKOFF_EXPONENT - 1)
+  static constexpr int MAX_BACKOFF_EXPONENT = 4;
 
   static const QString MESSAGE_STATUS;
   static const QString TILE_REQUEST_STATUS;

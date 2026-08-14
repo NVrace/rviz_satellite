@@ -18,6 +18,7 @@ limitations under the License. */
 #include <QImageReader>
 #include <QStandardPaths>
 #include <QString>
+#include <QTimer>
 #include <QtCore>
 #include <QtNetwork>
 #include <chrono>
@@ -29,7 +30,38 @@ limitations under the License. */
 namespace rviz_satellite
 {
 
-TileClient::TileClient() : manager_(new QNetworkAccessManager(this)), tile_promises_()
+/**
+ * @brief Whether a network error is expected to resolve itself on a retry
+ *
+ * Covers the failure modes of a briefly unstable connection. Everything else (missing tile,
+ * denied access, malformed url) is treated as permanent, so a misconfigured tile server is
+ * not hammered with retries.
+ */
+static bool is_transient(QNetworkReply::NetworkError error)
+{
+  switch (error) {
+    case QNetworkReply::ConnectionRefusedError:
+    case QNetworkReply::RemoteHostClosedError:
+    case QNetworkReply::HostNotFoundError:
+    case QNetworkReply::TimeoutError:
+    case QNetworkReply::TemporaryNetworkFailureError:
+    case QNetworkReply::NetworkSessionFailedError:
+    case QNetworkReply::ProxyConnectionRefusedError:
+    case QNetworkReply::ProxyConnectionClosedError:
+    case QNetworkReply::ProxyNotFoundError:
+    case QNetworkReply::ProxyTimeoutError:
+    case QNetworkReply::InternalServerError:
+    case QNetworkReply::ServiceUnavailableError:
+    case QNetworkReply::UnknownNetworkError:
+    case QNetworkReply::UnknownProxyError:
+    case QNetworkReply::UnknownServerError:
+      return true;
+    default:
+      return false;
+  }
+}
+
+TileClient::TileClient() : manager_(new QNetworkAccessManager(this)), requests_()
 {
   connect(manager_, SIGNAL(finished(QNetworkReply *)), SLOT(request_finished(QNetworkReply *)));
   QNetworkDiskCache * disk_cache = new QNetworkDiskCache(this);
@@ -39,6 +71,8 @@ TileClient::TileClient() : manager_(new QNetworkAccessManager(this)), tile_promi
   disk_cache->setCacheDirectory(cache_path);
   manager_->setCache(disk_cache);
 }
+
+TileClient::~TileClient() { abort_all(); }
 
 /**
  * @brief Request a specific tile
@@ -55,7 +89,7 @@ std::future<QImage> TileClient::request(TileId const & tile_id)
   }
 }
 
-std::future<QImage> TileClient::request_remote(TileId const & tile_id)
+QNetworkRequest TileClient::make_request(TileId const & tile_id) const
 {
   // see https://foundation.wikimedia.org/wiki/Maps_Terms_of_Use#Using_maps_in_third-party_services
   auto const request_url = QUrl(QString::fromStdString(tileURL(tile_id)));
@@ -68,17 +102,55 @@ std::future<QImage> TileClient::request_remote(TileId const & tile_id)
   request.setAttribute(
     QNetworkRequest::CacheLoadControlAttribute, QNetworkRequest::CacheLoadControl::PreferCache);
   request.setAttribute(QNetworkRequest::User, variant);
+  return request;
+}
 
-  std::promise<QImage> tile_promise;
-  auto entry = tile_promises_.emplace(tile_id, std::move(tile_promise));
-  if (!entry.second) {
-    RVIZ_COMMON_LOG_WARNING_STREAM("Tile request for tile '" << tile_id << "' is already running");
-    throw tile_request_error("Duplicate tile request");
-  } else {
-    RVIZ_COMMON_LOG_DEBUG_STREAM("Requesting tile " << request_url.toString().toStdString());
-    manager_->get(request);
+void TileClient::start_request(TileId const & tile_id, PendingRequest & pending)
+{
+  auto const request = make_request(tile_id);
+  ++pending.attempts;
+  RVIZ_COMMON_LOG_DEBUG_STREAM(
+    "Requesting tile " << request.url().toString().toStdString() << " (attempt "
+                       << pending.attempts << ")");
+  pending.reply = manager_->get(request);
+}
+
+void TileClient::schedule_retry(TileId const & tile_id, uint64_t generation, int delay_ms)
+{
+  QTimer::singleShot(delay_ms, this, [this, tile_id, generation]() {
+    auto it = requests_.find(tile_id);
+    if (it == requests_.end() || it->second.generation != generation || it->second.reply) {
+      // the request was aborted or superseded while the retry was pending
+      return;
+    }
+    start_request(tile_id, it->second);
+  });
+}
+
+std::future<QImage> TileClient::request_remote(TileId const & tile_id)
+{
+  // A request for this tile may still be in flight, because the map is rebuilt whenever the
+  // zoom, the url or the center tile change, without waiting for outstanding replies. Supersede
+  // the stale request instead of refusing the new one; refusing would leave the tile permanently
+  // unrequestable, since nothing ever retracts the stale entry.
+  auto existing = requests_.find(tile_id);
+  if (existing != requests_.end()) {
+    RVIZ_COMMON_LOG_DEBUG_STREAM("Superseding in-flight request for tile '" << tile_id << "'");
+    PendingRequest superseded = std::move(existing->second);
+    // erase before aborting: abort() re-enters request_finished, which must not find this entry
+    requests_.erase(existing);
+    if (superseded.reply) {
+      superseded.reply->abort();
+      superseded.reply->deleteLater();
+    }
+    // superseded.promise is broken here, its future reports std::future_error
   }
-  return entry.first->second.get_future();
+
+  auto & pending = requests_[tile_id];
+  pending.generation = ++generation_counter_;
+  auto future = pending.promise.get_future();
+  start_request(tile_id, pending);
+  return future;
 }
 
 std::future<QImage> TileClient::request_local(TileId const & tile_id)
@@ -107,23 +179,52 @@ std::future<QImage> TileClient::request_local(TileId const & tile_id)
   return f;
 }
 
+void TileClient::abort_all()
+{
+  // move out first: abort() re-enters request_finished, which must not find these entries
+  auto aborted = std::move(requests_);
+  requests_.clear();
+  for (auto & entry : aborted) {
+    if (entry.second.reply) {
+      entry.second.reply->abort();
+      entry.second.reply->deleteLater();
+    }
+  }
+  // the promises are broken here, their futures report std::future_error
+}
+
 void TileClient::request_finished(QNetworkReply * reply)
 {
+  // the reply is still readable until the event loop runs again
+  reply->deleteLater();
+
   const QVariant variant = reply->request().attribute(QNetworkRequest::User);
   auto tile_id = variant.value<TileId>();
 
-  auto promise_it = tile_promises_.find(tile_id);
-  // Erase the element pointed by iterator it
-  if (promise_it == tile_promises_.end()) {
-    RVIZ_COMMON_LOG_ERROR_STREAM(
-      "Tile request promise was removed before the network reply finished");
+  auto promise_it = requests_.find(tile_id);
+  if (promise_it == requests_.end() || promise_it->second.reply != reply) {
+    // the request was aborted or superseded, there is no promise left to fulfil
     return;
   }
+  // from here on, every path either erases the entry or schedules a retry for it; leaving a
+  // satisfied promise behind would make this tile unrequestable for the rest of the session
+  promise_it->second.reply = nullptr;
 
   const QUrl url = reply->url();
-  if (reply->error()) {
-    promise_it->second.set_exception(
-      std::make_exception_ptr(tile_request_error(reply->errorString().toStdString())));
+  auto const error = reply->error();
+  if (error != QNetworkReply::NoError) {
+    if (is_transient(error) && promise_it->second.attempts < MAX_ATTEMPTS) {
+      int const delay_ms = RETRY_BASE_DELAY_MS << (promise_it->second.attempts - 1);
+      RVIZ_COMMON_LOG_WARNING_STREAM(
+        "Tile request for " << url.toString().toStdString() << " failed ("
+                            << reply->errorString().toStdString() << "), retrying in " << delay_ms
+                            << " ms");
+      schedule_retry(tile_id, promise_it->second.generation, delay_ms);
+      return;
+    }
+    promise_it->second.promise.set_exception(std::make_exception_ptr(
+      tile_request_error(reply->errorString().toStdString(), is_transient(error))));
+    requests_.erase(promise_it);
     return;
   }
 
@@ -137,15 +238,24 @@ void TileClient::request_finished(QNetworkReply * reply)
 
   QImageReader reader(reply);
   if (!reader.canRead()) {
-    promise_it->second.set_exception(
-      std::make_exception_ptr(tile_request_error("Failed to decode tile image")));
+    // a truncated or empty body is a symptom of an unstable connection, so retry as well
+    if (promise_it->second.attempts < MAX_ATTEMPTS) {
+      int const delay_ms = RETRY_BASE_DELAY_MS << (promise_it->second.attempts - 1);
+      RVIZ_COMMON_LOG_WARNING_STREAM(
+        "Failed to decode image at " << url.toString().toStdString() << ", retrying in "
+                                     << delay_ms << " ms");
+      schedule_retry(tile_id, promise_it->second.generation, delay_ms);
+      return;
+    }
+    promise_it->second.promise.set_exception(
+      std::make_exception_ptr(tile_request_error("Failed to decode tile image", true)));
+    requests_.erase(promise_it);
     RVIZ_COMMON_LOG_ERROR_STREAM(
       "Failed to decode image at " << reply->request().url().toString().toStdString());
     return;
   }
-  promise_it->second.set_value(reader.read().mirrored());
-  tile_promises_.erase(promise_it);
-  reply->deleteLater();
+  promise_it->second.promise.set_value(reader.read().mirrored());
+  requests_.erase(promise_it);
 }
 
 }  // namespace rviz_satellite

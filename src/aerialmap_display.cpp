@@ -162,13 +162,19 @@ void AerialMapDisplay::onInitialize()
   orientation_frame_property_->setFrameManager(context_->getFrameManager());
 }
 
-void AerialMapDisplay::onEnable() { scene_node_->setVisible(true); }
+void AerialMapDisplay::onEnable()
+{
+  scene_node_->setVisible(true);
+  // subscribes; without this the display would only ever subscribe via updateTopic()
+  RTDClass::onEnable();
+}
 
 void AerialMapDisplay::onDisable()
 {
   scene_node_->setVisible(false);
-  resetTileServerError();
-  resetMap();
+  // unsubscribes and calls reset(), which aborts in-flight tile requests; without this the
+  // subscription and the pending downloads stay alive while the display is disabled
+  RTDClass::onDisable();
 }
 
 bool AerialMapDisplay::validateMessage(const NavSatFix::ConstSharedPtr message)
@@ -288,6 +294,11 @@ void AerialMapDisplay::processMessage(const NavSatFix::ConstSharedPtr msg)
     return;
   }
   last_fix_ = msg;
+  if (std::chrono::steady_clock::now() < retry_tiles_after_) {
+    // backing off after a transient failure, so the tile server is not hammered while the
+    // connection is down; the map is rebuilt from the next fix after the backoff elapsed
+    return;
+  }
   if (!validateProperties()) {
     return;
   } else {
@@ -299,11 +310,11 @@ void AerialMapDisplay::processMessage(const NavSatFix::ConstSharedPtr msg)
     const std::lock_guard<std::mutex> lock(tiles_mutex_);
     try {
       double tile_size_m = zoomSize(msg->latitude, tile_map_info_);
-      if (tiles_.empty()) {
+      if (tiles_.empty() || !center_tile_) {
         // create whole map initially
         buildMap(tile_at_fix, tile_size_m);
       } else {
-        auto center = centerTile();
+        auto center = *center_tile_;
         auto offset = Ogre::Vector2i(tile_at_fix.x - center.x, tile_at_fix.y - center.y);
         if (!offset.isZeroLength()) {
           auto blocks = blocks_property_->getInt();
@@ -313,23 +324,19 @@ void AerialMapDisplay::processMessage(const NavSatFix::ConstSharedPtr msg)
             // if center tile changed to some index direction, within the bounds of the surrounding blocks,
             // create only the missing tiles
             if (!shiftMap(center, offset, tile_size_m)) {
-              pending_tiles_.clear();
-              tiles_.clear();
+              clearTiles();
               buildMap(tile_at_fix, tile_size_m);
             }
           } else {
             // if more tiles than blocks are skipped, recreate the entire map
-            pending_tiles_.clear();
-            tiles_.clear();
+            clearTiles();
             buildMap(tile_at_fix, tile_size_m);
           }
         }
       }
     } catch (const tile_request_error & e) {
-      tile_server_had_errors_ = true;
-      pending_tiles_.clear();
-      tiles_.clear();
-      setStatus(rviz_common::properties::StatusProperty::Error, TILE_REQUEST_STATUS, e.what());
+      clearTiles();
+      handleTileRequestFailure(e);
     }
   }
   // set material properties on created tiles
@@ -337,12 +344,24 @@ void AerialMapDisplay::processMessage(const NavSatFix::ConstSharedPtr msg)
   updateDrawUnder();
 }
 
+/**
+ * @brief Whether a tile exists on the tile server at its zoom level
+ *
+ * Tile coordinates are bounded by the 2^zoom by 2^zoom grid of the Mercator projection.
+ * Requesting a tile outside of it yields a permanent error from the tile server.
+ */
+static bool isTileInBounds(const TileCoordinate & coordinate)
+{
+  int const number_of_tiles_per_dim = 1 << coordinate.z;
+  return coordinate.x >= 0 && coordinate.x < number_of_tiles_per_dim && coordinate.y >= 0 &&
+         coordinate.y < number_of_tiles_per_dim;
+}
+
 bool AerialMapDisplay::shiftMap(TileCoordinate center, Ogre::Vector2i offset, double tile_size_m)
 {
   int delta_x = offset.data[0];
   int delta_y = offset.data[1];
 
-  // TODO(ZeilingerM) validate map borders
   int blocks = blocks_property_->getInt();
   auto tile_url = tile_url_property_->getStdString();
 
@@ -354,8 +373,13 @@ bool AerialMapDisplay::shiftMap(TileCoordinate center, Ogre::Vector2i offset, do
     const TileId tile_to_delete{tile_url, coordinate_to_delete};
     auto erased = tiles_.erase(tile_to_delete);
     if (erased != 1) {
-      // Add error logging if needed
-      RVIZ_COMMON_LOG_ERROR("Failed to erase tile at far end");
+      if (isTileInBounds(coordinate_to_delete)) {
+        RVIZ_COMMON_LOG_ERROR("Failed to erase tile at far end");
+      } else {
+        // buildMap skipped this tile because it is out of bounds; a shift only adds tiles at the
+        // near end, so it cannot fill the holes such a map has. Let the caller rebuild instead.
+        RVIZ_COMMON_LOG_DEBUG("Map reaches the tile server bounds, rebuilding instead of shifting");
+      }
       return false;
     }
   }
@@ -371,38 +395,43 @@ bool AerialMapDisplay::shiftMap(TileCoordinate center, Ogre::Vector2i offset, do
     int x = center.x + near_offset.data[0];
     int y = center.y + near_offset.data[1];
     TileCoordinate new_coordinate{x, y, center.z};
+    // apply the same bounds as buildMap; without this, moving towards the edge of the map
+    // requests tiles the server does not have, which permanently disables the display
+    if (!isTileInBounds(new_coordinate)) {
+      continue;
+    }
     // set tile offset with the assumption of a new center
     buildTile(new_coordinate, near_offset - offset, tile_size_m);
   }
+  center_tile_ = TileCoordinate{center.x + delta_x, center.y + delta_y, center.z};
   return true;
 }
 
 void AerialMapDisplay::buildMap(TileCoordinate center_tile, double size)
 {
   int zoom = center_tile.z;
-  int number_of_tiles_per_dim = 1 << zoom;
   auto blocks = blocks_property_->getInt();
   for (int x = -blocks; x <= blocks; ++x) {
     for (int y = -blocks; y <= blocks; ++y) {
-      int tile_x = center_tile.x + x;
-      int tile_y = center_tile.y + y;
-      if (tile_x < 0 || tile_x >= number_of_tiles_per_dim) {
+      const TileCoordinate coordinate{center_tile.x + x, center_tile.y + y, zoom};
+      if (!isTileInBounds(coordinate)) {
         continue;
       }
-      if (tile_y < 0 || tile_y >= number_of_tiles_per_dim) {
-        continue;
-      }
-      buildTile({tile_x, tile_y, zoom}, Ogre::Vector2i(x, y), size);
+      buildTile(coordinate, Ogre::Vector2i(x, y), size);
     }
   }
+  // the center is tracked explicitly because the loop above skips out of bounds tiles: the map
+  // is then neither complete nor symmetric, so its center cannot be recovered from its contents
+  center_tile_ = center_tile;
 }
 
 void AerialMapDisplay::buildTile(TileCoordinate coordinate, Ogre::Vector2i offset, double size)
 {
   auto tile_url = tile_url_property_->getStdString();
   const TileId tile_id{tile_url, coordinate};
-  auto pending_emplace_result = pending_tiles_.emplace(tile_id, tile_client_.request(tile_id));
-  rcpputils::assert_true(pending_emplace_result.second, "failed to store tile request");
+  // a request or object for this tile may still exist, e.g. because the fix moved back across a
+  // tile border while the previous request was outstanding; replace it rather than assert on it
+  pending_tiles_.insert_or_assign(tile_id, tile_client_.request(tile_id));
 
   // position of each tile is set so the origin of the aerial map is the center of the middle tile
   double tx = offset.data[0] * size - size / 2;
@@ -411,6 +440,7 @@ void AerialMapDisplay::buildTile(TileCoordinate coordinate, Ogre::Vector2i offse
   double ty = -offset.data[1] * size - size / 2;
   std::stringstream ss;
   ss << tile_id;
+  tiles_.erase(tile_id);
   auto tile_emplace_result = tiles_.emplace(
     std::piecewise_construct, std::forward_as_tuple(tile_id),
     std::forward_as_tuple(scene_manager_, scene_node_, ss.str(), size, tx, ty, false));
@@ -462,6 +492,7 @@ void AerialMapDisplay::update(float, float)
   }
 
   // resolve pending tile requests, and set the received images as textures of their tiles
+  bool tile_request_failed = false;
   for (auto it = pending_tiles_.begin(); it != pending_tiles_.end();) {
     try {
       if (it->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
@@ -469,25 +500,29 @@ void AerialMapDisplay::update(float, float)
           auto image = it->second.get();
           if (image.isNull()) {
             // failed to read file, e.g., from filesystem
+            it = pending_tiles_.erase(it);
             continue;
           }
           auto tile_to_update = tiles_.find(it->first);
           if (tile_to_update == tiles_.end()) {
             // request was cleared since it was issued
+            it = pending_tiles_.erase(it);
             continue;
           }
           auto & tile_object = tile_to_update->second;
           tile_object.updateData(image);
           tile_object.setVisible(true);
+          if (consecutive_tile_failures_ > 0) {
+            // the tile server is answering again
+            resetTileServerError();
+          }
           // remove from pending requests
           it = pending_tiles_.erase(it);
         } catch (const tile_request_error & e) {
-          // log error and abort requests
-          RVIZ_COMMON_LOG_ERROR_STREAM("Tile request failed: " << e.what());
+          // abort the remaining requests; the map is rebuilt as a whole once requests resume
           it = pending_tiles_.end();
-          setStatus(rviz_common::properties::StatusProperty::Error, TILE_REQUEST_STATUS, e.what());
-          // disable requests until tile server relevant properties change
-          tile_server_had_errors_ = true;
+          tile_request_failed = true;
+          handleTileRequestFailure(e);
         }
       } else {
         // check next request
@@ -499,9 +534,8 @@ void AerialMapDisplay::update(float, float)
     }
   }
   // if an error was just discovered
-  if (tile_server_had_errors_) {
-    pending_tiles_.clear();
-    tiles_.clear();
+  if (tile_request_failed) {
+    clearTiles();
   }
 
   if (!last_fix_) {
@@ -566,18 +600,52 @@ void AerialMapDisplay::update(float, float)
   updateAlpha(t);
 }
 
+void AerialMapDisplay::clearTiles()
+{
+  // the caller must hold tiles_mutex_
+  tiles_.clear();
+  pending_tiles_.clear();
+  center_tile_.reset();
+  // the futures above are gone, so the downloads feeding them must not continue either
+  tile_client_.abort_all();
+}
+
 void AerialMapDisplay::resetMap()
 {
   const std::lock_guard<std::mutex> lock(tiles_mutex_);
-  tiles_.clear();
-  pending_tiles_.clear();
+  clearTiles();
 }
 
 void AerialMapDisplay::resetTileServerError()
 {
   tile_server_had_errors_ = false;
+  consecutive_tile_failures_ = 0;
+  retry_tiles_after_ = std::chrono::steady_clock::time_point{};
   setStatus(
     rviz_common::properties::StatusProperty::Ok, TILE_REQUEST_STATUS, "Last tile request OK");
+}
+
+void AerialMapDisplay::handleTileRequestFailure(const tile_request_error & e)
+{
+  if (!e.transient()) {
+    // requesting again cannot help, so stop until a tile server relevant property changes
+    tile_server_had_errors_ = true;
+    RVIZ_COMMON_LOG_ERROR_STREAM("Tile request failed: " << e.what());
+    setStatus(rviz_common::properties::StatusProperty::Error, TILE_REQUEST_STATUS, e.what());
+    return;
+  }
+
+  consecutive_tile_failures_ = std::min(consecutive_tile_failures_ + 1, MAX_BACKOFF_EXPONENT);
+  auto const backoff =
+    std::chrono::milliseconds(TILE_RETRY_BASE_DELAY_MS << (consecutive_tile_failures_ - 1));
+  retry_tiles_after_ = std::chrono::steady_clock::now() + backoff;
+  RVIZ_COMMON_LOG_WARNING_STREAM(
+    "Tile request failed: " << e.what() << "; retrying in " << backoff.count() << " ms");
+  setStatus(
+    rviz_common::properties::StatusProperty::Warn, TILE_REQUEST_STATUS,
+    QString("Tile request failed, retrying in %1 s: %2")
+      .arg(backoff.count() / 1000.0, 0, 'f', 1)
+      .arg(QString::fromStdString(e.what())));
 }
 
 void AerialMapDisplay::updateAlpha(const rclcpp::Time & t)
@@ -609,18 +677,6 @@ rclcpp::Duration AerialMapDisplay::tf_tolerance() const
 {
   auto tf_tolerance_sec = tf_tolerance_property_->getFloat();
   return rclcpp::Duration(std::chrono::duration<double>(tf_tolerance_sec));
-}
-
-TileCoordinate AerialMapDisplay::centerTile() const
-{
-  // when calling this function internally, the tiles must already be created
-  // they must also always have an uneven count, since the center tile is surrounded by a field of
-  // an uneven number of sides; thus, there is a clear center tile
-  assert(!tiles_.empty());
-  assert((tiles_.size() % 2) == 1);
-  auto it = tiles_.begin();
-  std::advance(it, tiles_.size() / 2);
-  return it->first.coord;
 }
 
 double AerialMapDisplay::computeUTMrotation(double latitude, double longitude)

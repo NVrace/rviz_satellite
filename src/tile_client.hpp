@@ -28,26 +28,33 @@ namespace rviz_satellite
 
 class tile_request_error : public std::exception
 {
+public:
+  enum class Kind
+  {
+    /// timeouts, dropped connections, truncated images: repeating the request may succeed
+    transient,
+    /// the tile server answered that it does not have this tile
+    not_found,
+    /// denied access, malformed url: the request cannot succeed without a property change
+    permanent,
+  };
+
 private:
   std::string message_;
-  bool transient_;
+  Kind kind_;
 
 public:
-  explicit tile_request_error(const std::string & message, bool transient = false)
-  : message_(message), transient_(transient)
+  explicit tile_request_error(const std::string & message, Kind kind = Kind::permanent)
+  : message_(message), kind_(kind)
   {
   }
 
   const char * what() const noexcept override { return message_.c_str(); }
 
-  /**
-   * @brief Whether the failure is expected to resolve itself
-   *
-   * Transient failures (timeouts, dropped connections, truncated images, server side errors)
-   * are worth retrying. Permanent failures (unknown host path, missing tile, denied access)
-   * indicate a misconfiguration and require a property change.
-   */
-  bool transient() const noexcept { return transient_; }
+  Kind kind() const noexcept { return kind_; }
+
+  /// Whether the failure is expected to resolve itself
+  bool transient() const noexcept { return kind_ == Kind::transient; }
 };
 
 /**

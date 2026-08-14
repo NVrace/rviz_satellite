@@ -31,13 +31,14 @@ namespace rviz_satellite
 {
 
 /**
- * @brief Whether a network error is expected to resolve itself on a retry
+ * @brief Classify a network error so the display can react to it
  *
- * Covers the failure modes of a briefly unstable connection. Everything else (missing tile,
- * denied access, malformed url) is treated as permanent, so a misconfigured tile server is
- * not hammered with retries.
+ * Transient covers the failure modes of a briefly unstable connection, and is retried.
+ * A tile the server does not have is reported separately, because a local tile set that does not
+ * cover the whole area is normal, whereas a missing tile from a global server means the url or
+ * the zoom level is wrong. Everything else is permanent.
  */
-static bool is_transient(QNetworkReply::NetworkError error)
+static tile_request_error::Kind classify(QNetworkReply::NetworkError error)
 {
   switch (error) {
     case QNetworkReply::ConnectionRefusedError:
@@ -55,9 +56,12 @@ static bool is_transient(QNetworkReply::NetworkError error)
     case QNetworkReply::UnknownNetworkError:
     case QNetworkReply::UnknownProxyError:
     case QNetworkReply::UnknownServerError:
-      return true;
+      return tile_request_error::Kind::transient;
+    case QNetworkReply::ContentNotFoundError:
+    case QNetworkReply::ContentGoneError:
+      return tile_request_error::Kind::not_found;
     default:
-      return false;
+      return tile_request_error::Kind::permanent;
   }
 }
 
@@ -213,7 +217,8 @@ void TileClient::request_finished(QNetworkReply * reply)
   const QUrl url = reply->url();
   auto const error = reply->error();
   if (error != QNetworkReply::NoError) {
-    if (is_transient(error) && promise_it->second.attempts < MAX_ATTEMPTS) {
+    auto const kind = classify(error);
+    if (kind == tile_request_error::Kind::transient && promise_it->second.attempts < MAX_ATTEMPTS) {
       int const delay_ms = RETRY_BASE_DELAY_MS << (promise_it->second.attempts - 1);
       RVIZ_COMMON_LOG_WARNING_STREAM(
         "Tile request for " << url.toString().toStdString() << " failed ("
@@ -222,8 +227,8 @@ void TileClient::request_finished(QNetworkReply * reply)
       schedule_retry(tile_id, promise_it->second.generation, delay_ms);
       return;
     }
-    promise_it->second.promise.set_exception(std::make_exception_ptr(
-      tile_request_error(reply->errorString().toStdString(), is_transient(error))));
+    promise_it->second.promise.set_exception(
+      std::make_exception_ptr(tile_request_error(reply->errorString().toStdString(), kind)));
     requests_.erase(promise_it);
     return;
   }
@@ -247,8 +252,8 @@ void TileClient::request_finished(QNetworkReply * reply)
       schedule_retry(tile_id, promise_it->second.generation, delay_ms);
       return;
     }
-    promise_it->second.promise.set_exception(
-      std::make_exception_ptr(tile_request_error("Failed to decode tile image", true)));
+    promise_it->second.promise.set_exception(std::make_exception_ptr(
+      tile_request_error("Failed to decode tile image", tile_request_error::Kind::transient)));
     requests_.erase(promise_it);
     RVIZ_COMMON_LOG_ERROR_STREAM(
       "Failed to decode image at " << reply->request().url().toString().toStdString());

@@ -75,10 +75,16 @@ protected:
 
   void buildTile(TileCoordinate coordinate, Ogre::Vector2i offset, double size);
 
+  /// Whether a tile can exist on the configured tile server
+  bool isTileInBounds(const TileCoordinate & coordinate) const;
+
   /// Drop all tiles and abort their requests; the caller must hold tiles_mutex_
   void clearTiles();
 
   void resetMap();
+
+  /// Report either the missing tile count or an all clear on TILE_REQUEST_STATUS
+  void updateTileRequestStatus();
 
   void resetTileServerError();
 
@@ -130,6 +136,8 @@ protected:
   /// no tiles are requested before this point in time, to back off after transient failures
   std::chrono::steady_clock::time_point retry_tiles_after_{};
   int consecutive_tile_failures_{0};
+  /// tiles of the current map the tile server reported as not available
+  int missing_tiles_{0};
 
   /// Delay before the map is rebuilt after a transient failure; doubled per consecutive failure
   static constexpr int TILE_RETRY_BASE_DELAY_MS = 1000;

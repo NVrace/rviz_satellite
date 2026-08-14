@@ -62,6 +62,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_field test/test_field.cpp)
   target_link_libraries(test_field ${PROJECT_NAME})
   target_include_directories(test_field PRIVATE src)
+
+  ament_add_gtest(test_tile test/test_tile.cpp)
+  target_link_libraries(test_tile ${PROJECT_NAME})
+  target_include_directories(test_tile PRIVATE src)
 endif()
 
 ament_export_dependencies(rclcpp pluginlib rviz_common rviz_default_plugins sensor_msgs)

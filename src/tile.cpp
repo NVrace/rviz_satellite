@@ -92,9 +92,14 @@ Vector2Double computeTileCoordinate(
 TileCoordinate fromWGS(const sensor_msgs::msg::NavSatFix & point, TileMapInformation tile_map_info)
 {
   auto coord = computeTileCoordinate(point, tile_map_info);
+  // Floor rather than truncate: local map coordinates are relative to the configured origin and
+  // are negative west and north of it, where truncation towards zero lands one tile off. It also
+  // disagreed with tileOffset below, which has always used floor, so the tile the display picked
+  // and the offset within that tile referred to different tiles. In global mode both coordinates
+  // are non-negative, so flooring is identical to truncating there.
   return TileCoordinate{
-    static_cast<int>(coord.x),
-    static_cast<int>(coord.y),
+    static_cast<int>(std::floor(coord.x)),
+    static_cast<int>(std::floor(coord.y)),
     tile_map_info.zoom,
   };
 }

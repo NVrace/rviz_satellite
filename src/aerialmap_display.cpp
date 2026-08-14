@@ -207,6 +207,11 @@ bool AerialMapDisplay::validateProperties()
 
   if (tile_map_info_.local_map) {
     updateLocalTileMapInformation();
+    if (tile_map_info_.transformation == nullptr) {
+      // without the projection, proj_trans passes the fix through unchanged and every tile
+      // coordinate is computed from degrees as if they were the origin's units
+      return false;
+    }
   }
 
   return true;
@@ -232,18 +237,18 @@ void AerialMapDisplay::updateDrawUnder()
 
 void AerialMapDisplay::updateTileUrl()
 {
-  // updated tile url may work
-  resetTileServerError();
   // rebuild on next received message
   resetMap();
+  // updated tile url may work; clears the counters resetMap() just reset the map for
+  resetTileServerError();
 }
 
 void AerialMapDisplay::updateZoom()
 {
-  // updated zoom may be supported by this tile server
-  resetTileServerError();
   // rebuild on next received message
   resetMap();
+  // updated zoom may be supported by this tile server
+  resetTileServerError();
 }
 
 void AerialMapDisplay::updateBlocks()
@@ -256,6 +261,9 @@ void AerialMapDisplay::updateLocalMap()
 {
   // update local map variable
   tile_map_info_.local_map = local_map_property_->getValue().toBool();
+  // tile coordinates mean something different in either mode, so the existing tiles are stale
+  resetMap();
+  resetTileServerError();
 }
 
 void AerialMapDisplay::updateLocalTileMapInformation()
@@ -263,19 +271,31 @@ void AerialMapDisplay::updateLocalTileMapInformation()
   tile_map_info_.meter_per_pixel_z0 = local_meter_per_pixel_z0_property_->getFloat();
   tile_map_info_.origin_x = local_origin_x_property_->getFloat();
   tile_map_info_.origin_y = local_origin_y_property_->getFloat();
-  tile_map_info_.origin_crs = local_origin_crs_property_->getStdString();
   tile_map_info_.project_to_utm = visualize_in_utm_frame->getBool();
 
-  // create transformation if not already set
-  if (!tile_map_info_.origin_crs.empty()) {
-    tile_map_info_.transformation = proj_create_crs_to_crs(
-      tile_map_info_.context, "EPSG:4326", tile_map_info_.origin_crs.c_str(), NULL);
+  // This runs for every received message. proj_create_crs_to_crs allocates, so creating the
+  // transformation unconditionally leaked one PJ per fix; only build it when it is missing or
+  // when the configured CRS actually changed, and release the one it replaces.
+  auto const origin_crs = local_origin_crs_property_->getStdString();
+  if (origin_crs != tile_map_info_.origin_crs || tile_map_info_.transformation == nullptr) {
+    if (tile_map_info_.transformation != nullptr) {
+      proj_destroy(tile_map_info_.transformation);
+      tile_map_info_.transformation = nullptr;
+    }
+    tile_map_info_.origin_crs = origin_crs;
+    if (!origin_crs.empty()) {
+      tile_map_info_.transformation = proj_create_crs_to_crs(
+        tile_map_info_.context, "EPSG:4326", origin_crs.c_str(), NULL);
+    }
   }
+
   // set status if transformation is still not set
   if (tile_map_info_.transformation == nullptr) {
     setStatus(
       rviz_common::properties::StatusProperty::Error, PROJ_TRANSFORM_STATUS,
       "PROJ transformation for local map origin not set.");
+  } else {
+    deleteStatus(PROJ_TRANSFORM_STATUS);
   }
 }
 
@@ -344,14 +364,17 @@ void AerialMapDisplay::processMessage(const NavSatFix::ConstSharedPtr msg)
   updateDrawUnder();
 }
 
-/**
- * @brief Whether a tile exists on the tile server at its zoom level
- *
- * Tile coordinates are bounded by the 2^zoom by 2^zoom grid of the Mercator projection.
- * Requesting a tile outside of it yields a permanent error from the tile server.
- */
-static bool isTileInBounds(const TileCoordinate & coordinate)
+bool AerialMapDisplay::isTileInBounds(const TileCoordinate & coordinate) const
 {
+  if (tile_map_info_.local_map) {
+    // A local tile set has no globally known extent. Its coordinates are relative to the
+    // configured origin, so they are negative west and north of it, and the 2^zoom grid below
+    // does not apply. Tiles the set does not cover are reported missing by the server and are
+    // left blank instead of being predicted here.
+    return true;
+  }
+  // Tile coordinates are bounded by the 2^zoom by 2^zoom grid of the Mercator projection.
+  // Requesting a tile outside of it yields a permanent error from the tile server.
   int const number_of_tiles_per_dim = 1 << coordinate.z;
   return coordinate.x >= 0 && coordinate.x < number_of_tiles_per_dim && coordinate.y >= 0 &&
          coordinate.y < number_of_tiles_per_dim;
@@ -519,10 +542,20 @@ void AerialMapDisplay::update(float, float)
           // remove from pending requests
           it = pending_tiles_.erase(it);
         } catch (const tile_request_error & e) {
-          // abort the remaining requests; the map is rebuilt as a whole once requests resume
-          it = pending_tiles_.end();
-          tile_request_failed = true;
-          handleTileRequestFailure(e);
+          if (e.kind() == tile_request_error::Kind::not_found && tile_map_info_.local_map) {
+            // A local tile set covering only part of the area is normal, so a tile it does not
+            // have is a blank spot rather than a failure. The invisible tile object is kept, so
+            // the field keeps the shape shiftMap expects.
+            RVIZ_COMMON_LOG_DEBUG_STREAM("Tile not available: " << e.what());
+            ++missing_tiles_;
+            updateTileRequestStatus();
+            it = pending_tiles_.erase(it);
+          } else {
+            // abort the remaining requests; the map is rebuilt as a whole once requests resume
+            it = pending_tiles_.end();
+            tile_request_failed = true;
+            handleTileRequestFailure(e);
+          }
         }
       } else {
         // check next request
@@ -606,6 +639,7 @@ void AerialMapDisplay::clearTiles()
   tiles_.clear();
   pending_tiles_.clear();
   center_tile_.reset();
+  missing_tiles_ = 0;
   // the futures above are gone, so the downloads feeding them must not continue either
   tile_client_.abort_all();
 }
@@ -616,13 +650,24 @@ void AerialMapDisplay::resetMap()
   clearTiles();
 }
 
+void AerialMapDisplay::updateTileRequestStatus()
+{
+  if (missing_tiles_ > 0) {
+    setStatus(
+      rviz_common::properties::StatusProperty::Warn, TILE_REQUEST_STATUS,
+      QString("%1 tile(s) not available on the tile server").arg(missing_tiles_));
+  } else {
+    setStatus(
+      rviz_common::properties::StatusProperty::Ok, TILE_REQUEST_STATUS, "Last tile request OK");
+  }
+}
+
 void AerialMapDisplay::resetTileServerError()
 {
   tile_server_had_errors_ = false;
   consecutive_tile_failures_ = 0;
   retry_tiles_after_ = std::chrono::steady_clock::time_point{};
-  setStatus(
-    rviz_common::properties::StatusProperty::Ok, TILE_REQUEST_STATUS, "Last tile request OK");
+  updateTileRequestStatus();
 }
 
 void AerialMapDisplay::handleTileRequestFailure(const tile_request_error & e)
